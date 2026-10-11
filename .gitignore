@@ -4,6 +4,7 @@ __*
 .DS_Store
 *.zip
 *.rar
+tests
 
 #movie files
 *.mp4
