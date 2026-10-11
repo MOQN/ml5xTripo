@@ -1,4 +1,6 @@
 class TripoRiggedModel {
+  // heads up: the p5 web editor breaks any for/while loop that runs longer than 100ms,
+  // so every loop that can get big (vertices, faces, parts, textures) uses forEach/map/Array.from.
   constructor(options = {}) {
     const p = globalThis.p5?.instance;
     if (!p?._renderer?.isP3D) {
@@ -6,7 +8,7 @@ class TripoRiggedModel {
     }
 
     this.p = p;
-    this.options = { ...TripoRiggedModel.#defaults };
+    this.options = { ...TripoRiggedModel._defaults };
     this.setOptions(options);
     this.scene = null;
     this.parts = [];
@@ -18,12 +20,17 @@ class TripoRiggedModel {
     this.error = null;
     this.loadId = 0;
     this.disposed = false;
-    this.id = TripoRiggedModel.#nextId++;
-    this.#dropDocument = p.canvas.ownerDocument;
-    if (this.#dropDocument.addEventListener) {
-      TripoRiggedModel.#dropModels.push(this);
-      this.#dropDocument.addEventListener("dragover", this.#onDragOver);
-      this.#dropDocument.addEventListener("drop", this.#onDrop);
+    this.id = TripoRiggedModel._nextId++;
+    this._position = [0, 0];
+    this._rotation = [0, 0, 0];
+    this._displayScale = 1;
+    this._onDragOver = this._onDragOver.bind(this);
+    this._onDrop = this._onDrop.bind(this);
+    this._dropDocument = p.canvas.ownerDocument;
+    if (this._dropDocument.addEventListener) {
+      TripoRiggedModel._dropModels.push(this);
+      this._dropDocument.addEventListener("dragover", this._onDragOver);
+      this._dropDocument.addEventListener("drop", this._onDrop);
     }
   }
 
@@ -40,7 +47,7 @@ class TripoRiggedModel {
   }
 
   async load(source) {
-    this.#assertActive();
+    this._assertActive();
     const loadId = ++this.loadId;
     const objectUrls = [];
     try {
@@ -60,25 +67,25 @@ class TripoRiggedModel {
         if (!response.ok) throw new Error(`GLB load failed (${response.status}): ${source}`);
         bytes = await response.arrayBuffer();
       }
-      const parsed = this.#parseGLB(bytes);
-      const prepared = this.#createScene(parsed, loadId);
+      const parsed = this._parseGLB(bytes);
+      const prepared = this._createScene(parsed, loadId);
 
-      for (const part of prepared.parts) {
-        if (part.textureIndex === undefined) continue;
-        const imageSource = this.#imageSource(parsed, part.textureIndex, isFile ? null : source);
+      await Promise.all(prepared.parts.map(async (part) => {
+        if (part.textureIndex === undefined) return;
+        const imageSource = this._imageSource(parsed, part.textureIndex, isFile ? null : source);
         if (imageSource.startsWith("blob:")) objectUrls.push(imageSource);
         part.texture = await new Promise((resolve, reject) => {
           this.p.loadImage(imageSource, resolve, () => reject(new Error(`Could not load GLB texture: ${imageSource}`)));
         });
-      }
+      }));
       // a newer load gets the final say; keep the current model until its replacement is ready.
       if (this.disposed || loadId !== this.loadId) {
         throw new Error(`GLB load cancelled: ${isFile ? source.name : source}`);
       }
 
-      for (const part of prepared.parts) this.#updateGeometry(part, prepared);
-      const bounds = this.#measureBounds(prepared.parts);
-      this.#releaseScene();
+      prepared.parts.forEach((part) => this._updateGeometry(part, prepared));
+      const bounds = this._measureBounds(prepared.parts);
+      this._releaseScene();
       this.scene = prepared;
       this.parts = prepared.parts;
       this.rig = prepared.rig;
@@ -96,41 +103,41 @@ class TripoRiggedModel {
   }
 
   update(poses, elapsedMs = this.p.deltaTime) {
-    this.#assertActive();
+    this._assertActive();
     if (!Array.isArray(poses)) {
       throw new TypeError("update() requires the ml5 poses array. Pass [] when no person is detected.");
     }
     if (!Number.isFinite(elapsedMs) || elapsedMs < 0) {
       throw new RangeError("update() requires a finite, nonnegative elapsed time in milliseconds.");
     }
-    this.#setPose(poses[0] ?? null);
+    this._setPose(poses[0] ?? null);
     // keep the old 60 fps feel, but use elapsed time instead of counting frames.
     const frameSteps = elapsedMs / (1000 / 60);
     const amount = elapsedMs === 0 ? 0 : 1 - Math.pow(1 - this.options.smoothing, frameSteps);
-    this.#updateRig(amount);
+    this._updateRig(amount);
     // no movement means no vertex work or gpu buffer upload.
-    for (const part of this.parts) {
-      const version = this.#geometryVersion(part);
+    this.parts.forEach((part) => {
+      const version = this._geometryVersion(part);
       if (version !== part.worldVersion || part.modelScale !== this.options.modelScale) {
-        this.#updateGeometry(part);
+        this._updateGeometry(part);
       }
-    }
-    this.#updateTrace(frameSteps);
+    });
+    this._updateTrace(frameSteps);
     return this;
   }
 
   draw(...coordinates) {
-    this.#assertActive();
+    this._assertActive();
     if (coordinates.length) this.position(...coordinates);
     const p = this.p;
     p.push();
     try {
       // place the centered model first, then fit its geometry inside that transform.
-      p.translate(...this.#position, 0);
-      p.rotateX(this.#rotation[0]);
-      p.rotateY(this.#rotation[1]);
-      p.rotateZ(this.#rotation[2]);
-      p.scale(this.#displayScale);
+      p.translate(...this._position, 0);
+      p.rotateX(this._rotation[0]);
+      p.rotateY(this._rotation[1]);
+      p.rotateZ(this._rotation[2]);
+      p.scale(this._displayScale);
       if (this.bounds) {
         // fit against the bind pose so the model doesn't resize as the person moves.
         const ratio = this.options.modelScale / this.bounds.modelScale;
@@ -146,7 +153,8 @@ class TripoRiggedModel {
       p.textureMode(p.NORMAL);
 
       if (this.options.visible) {
-        for (const part of this.parts) {
+        // the first draw uploads big textures to the gpu, which can take a while.
+        this.parts.forEach((part) => {
           const [r, g, b] = part.baseColor.map((value) => value * 255);
           p.fill(r, g, b, part.alpha * 255);
           if (part.texture) {
@@ -154,10 +162,10 @@ class TripoRiggedModel {
             p.texture(part.texture);
           }
           p.model(part.geometry);
-        }
+        });
       }
-      if (this.options.showSkeleton) this.#drawSkeleton();
-      this.#drawTrace();
+      if (this.options.showSkeleton) this._drawSkeleton();
+      this._drawTrace();
     } finally {
       p.pop();
     }
@@ -165,29 +173,29 @@ class TripoRiggedModel {
   }
 
   position(x, y) {
-    this.#assertActive();
+    this._assertActive();
     if (arguments.length !== 2 || ![x, y].every(Number.isFinite)) {
       throw new TypeError("position(x, y) requires 2 finite numbers.");
     }
-    this.#position = [x, y];
+    this._position = [x, y];
     return this;
   }
 
   scale(value) {
-    this.#assertActive();
+    this._assertActive();
     if (arguments.length !== 1 || !Number.isFinite(value)) {
       throw new TypeError("scale(value) requires 1 finite number.");
     }
-    this.#displayScale = value;
+    this._displayScale = value;
     return this;
   }
 
-  rotateX(angle) { return this.#setRotation(0, angle); }
-  rotateY(angle) { return this.#setRotation(1, angle); }
-  rotateZ(angle) { return this.#setRotation(2, angle); }
+  rotateX(angle) { return this._setRotation(0, angle); }
+  rotateY(angle) { return this._setRotation(1, angle); }
+  rotateZ(angle) { return this._setRotation(2, angle); }
 
   rotate(x, y, z) {
-    this.#assertActive();
+    this._assertActive();
     if (arguments.length !== 3) {
       console.warn("[TripoRiggedModel] rotate(x, y, z): please provide all 3 arguments.");
       return this;
@@ -195,13 +203,13 @@ class TripoRiggedModel {
     if (![x, y, z].every(Number.isFinite)) {
       throw new TypeError("rotate(x, y, z) requires 3 finite numbers.");
     }
-    this.#rotation = [x, y, z];
+    this._rotation = [x, y, z];
     return this;
   }
 
   setOptions(options) {
     for (const key of Object.keys(options)) {
-      if (!Object.hasOwn(TripoRiggedModel.#defaults, key)) {
+      if (!Object.hasOwn(TripoRiggedModel._defaults, key)) {
         throw new TypeError(`Unknown TripoRiggedModel option: ${key}`);
       }
     }
@@ -230,7 +238,7 @@ class TripoRiggedModel {
   }
 
   setSkeleton(connections) {
-    this.#assertActive();
+    this._assertActive();
     if (!Array.isArray(connections) || connections.some((pair) => (
       !Array.isArray(pair) || pair.length !== 2 || pair.some((i) => !Number.isInteger(i) || i < 0)
     ))) throw new TypeError("setSkeleton() requires ml5 getSkeleton() index pairs.");
@@ -248,43 +256,38 @@ class TripoRiggedModel {
     if (this.disposed) return;
     this.disposed = true;
     this.loadId++;
-    this.#dropDocument.removeEventListener?.("dragover", this.#onDragOver);
-    this.#dropDocument.removeEventListener?.("drop", this.#onDrop);
-    TripoRiggedModel.#dropModels = TripoRiggedModel.#dropModels.filter((model) => model !== this);
-    this.#releaseScene();
+    this._dropDocument.removeEventListener?.("dragover", this._onDragOver);
+    this._dropDocument.removeEventListener?.("drop", this._onDrop);
+    TripoRiggedModel._dropModels = TripoRiggedModel._dropModels.filter((model) => model !== this);
+    this._releaseScene();
     this.clearPose();
   }
 
-  #assertActive() {
+  _assertActive() {
     if (this.disposed) throw new Error("This TripoRiggedModel object has been disposed.");
   }
 
-  #position = [0, 0];
-  #rotation = [0, 0, 0];
-  #displayScale = 1;
-  #dropDocument;
-
-  #setRotation(axis, angle) {
-    this.#assertActive();
+  _setRotation(axis, angle) {
+    this._assertActive();
     if (!Number.isFinite(angle)) throw new TypeError("Rotation requires a finite angle.");
-    this.#rotation[axis] = angle;
+    this._rotation[axis] = angle;
     return this;
   }
 
-  #acceptsDrop(event) {
-    return TripoRiggedModel.#dropModels.findLast((model) => (
-      model.#dropDocument === this.#dropDocument
+  _acceptsDrop(event) {
+    return TripoRiggedModel._dropModels.findLast((model) => (
+      model._dropDocument === this._dropDocument
     )) === this && Array.from(event.dataTransfer?.types ?? []).includes("Files");
   }
 
-  #onDragOver = (event) => {
-    if (!this.#acceptsDrop(event)) return;
+  _onDragOver(event) {
+    if (!this._acceptsDrop(event)) return;
     event.preventDefault();
     event.dataTransfer.dropEffect = "copy";
-  };
+  }
 
-  #onDrop = async (event) => {
-    if (!this.#acceptsDrop(event)) return;
+  async _onDrop(event) {
+    if (!this._acceptsDrop(event)) return;
     event.preventDefault();
     const files = Array.from(event.dataTransfer.files);
     if (files.length !== 1) {
@@ -297,9 +300,9 @@ class TripoRiggedModel {
     } catch {
       // load already reports the error; don't leave an unhandled event promise.
     }
-  };
+  }
 
-  #releaseScene() {
+  _releaseScene() {
     for (const part of this.parts) this.p.freeGeometry(part.geometry);
     this.scene = null;
     this.parts = [];
@@ -307,17 +310,15 @@ class TripoRiggedModel {
     this.bounds = null;
   }
 
-  #measureBounds(parts) {
+  _measureBounds(parts) {
     const min = [Infinity, Infinity, Infinity];
     const max = [-Infinity, -Infinity, -Infinity];
-    for (const part of parts) {
-      for (const point of part.geometry.vertices) {
-        for (const [index, value] of [point.x, point.y, point.z].entries()) {
-          min[index] = Math.min(min[index], value);
-          max[index] = Math.max(max[index], value);
-        }
-      }
-    }
+    parts.forEach((part) => part.geometry.vertices.forEach((point) => {
+      [point.x, point.y, point.z].forEach((value, index) => {
+        min[index] = Math.min(min[index], value);
+        max[index] = Math.max(max[index], value);
+      });
+    }));
     return {
       center: min.map((value, i) => (value + max[i]) / 2),
       size: min.map((value, i) => Math.max(max[i] - value, 1)),
@@ -326,7 +327,7 @@ class TripoRiggedModel {
   }
 
   // let's turn the detected pose into bone rotations.
-  #setPose(pose) {
+  _setPose(pose) {
     if (pose == null) {
       this.clearPose();
       return;
@@ -347,17 +348,17 @@ class TripoRiggedModel {
     this.pose = next;
   }
 
-  #landmark(name) {
+  _landmark(name) {
     const point = this.pose.get(name);
     if (!point || point.confidence < this.options.minConfidence) return null;
     return [point.x * (this.options.mirror ? -1 : 1), -point.y, -point.z];
   }
 
-  #updateRig(amount) {
+  _updateRig(amount) {
     if (!this.scene || amount === 0) return;
     const changed = new Set();
     // walk parents first, and touch each affected descendant only once.
-    for (const node of this.scene.order) {
+    this.scene.order.forEach((node) => {
       const item = this.scene.rigByNode.get(node);
       let localChanged = false;
       if (item) {
@@ -365,24 +366,24 @@ class TripoRiggedModel {
           if (!this.options.modelMirror) return name;
           return name.startsWith("left_") ? `right_${name.slice(5)}` : `left_${name.slice(6)}`;
         });
-        const points = names.map((name) => this.#landmark(name));
+        const points = names.map((name) => this._landmark(name));
         let target = item.bindLocalQuaternion;
         if (points.every(Boolean)) {
-          let direction = this.#subtract(points[1], points[0]);
+          let direction = this._subtract(points[1], points[0]);
           if (points.length === 4) {
-            direction = this.#scale(this.#add(direction, this.#subtract(points[3], points[2])), 0.5);
+            direction = this._scale(this._add(direction, this._subtract(points[3], points[2])), 0.5);
           }
-          if (this.#length(direction) > 1e-12) {
-            const delta = this.#quaternionBetween(item.bindDirection, this.#normalize(direction));
-            const desired = this.#normalizeQuaternion(this.#multiplyQuaternion(delta, item.bindWorldQuaternion));
+          if (this._length(direction) > 1e-12) {
+            const delta = this._quaternionBetween(item.bindDirection, this._normalize(direction));
+            const desired = this._normalizeQuaternion(this._multiplyQuaternion(delta, item.bindWorldQuaternion));
             const parentRotation = item.bone.parent?.worldRotation ?? [0, 0, 0, 1];
-            target = this.#normalizeQuaternion(this.#multiplyQuaternion(this.#inverseQuaternion(parentRotation), desired));
+            target = this._normalizeQuaternion(this._multiplyQuaternion(this._inverseQuaternion(parentRotation), desired));
           }
         }
         const current = item.currentQuaternion;
         // q and -q are the same rotation; stay on the same side when settling.
-        if (this.#dot(current, target) < 0) target = target.map((value) => -value);
-        const next = this.#slerp(current, target, amount);
+        if (this._dot(current, target) < 0) target = target.map((value) => -value);
+        const next = this._slerp(current, target, amount);
         // snap tiny component differences so smoothing can actually finish.
         if (next.every((value, i) => Math.abs(value - target[i]) < 5e-8)) {
           for (let i = 0; i < 4; i++) next[i] = target[i];
@@ -395,29 +396,29 @@ class TripoRiggedModel {
         }
       }
       if (localChanged || changed.has(node.parent)) {
-        this.#updateWorldNode(node);
+        this._updateWorldNode(node);
         changed.add(node);
       }
-    }
+    });
   }
 
-  #geometryVersion(part) {
+  _geometryVersion(part) {
     return part.jointsData
       ? part.joints.reduce((sum, joint) => sum + joint.worldVersion, 0)
       : part.node.worldVersion;
   }
 
-  #updateGeometry(part, scene = this.scene) {
+  _updateGeometry(part, scene = this.scene) {
     const { vertices, vertexNormals: normals, faces } = part.geometry;
     const { positions, jointsData, weightsData, normalsData } = part;
     const modelScale = this.options.modelScale;
     const [ox, oy, oz] = scene.offset;
     const matrices = part.joints.map((joint, index) => (
       // these are world-space skin matrices; don't apply the mesh node twice.
-      this.#multiplyMatrix(joint.worldMatrix, part.inverseBinds[index])
+      this._multiplyMatrix(joint.worldMatrix, part.inverseBinds[index])
     ));
     // keep this hot loop scalar: temporary arrays per vertex make garbage collection expensive.
-    for (let index = 0; index < part.vertexCount; index++) {
+    vertices.forEach((vertex, index) => {
       const x = positions[index * 3];
       const y = positions[index * 3 + 1];
       const z = positions[index * 3 + 2];
@@ -467,7 +468,7 @@ class TripoRiggedModel {
         a = m[0]; b = m[4]; c = m[8];
         d = m[1]; e = m[5]; f = m[9]; g = m[2]; h = m[6]; k = m[10];
       }
-      vertices[index].set((px + ox) * modelScale, -(py + oy) * modelScale, (pz + oz) * modelScale);
+      vertex.set((px + ox) * modelScale, -(py + oy) * modelScale, (pz + oz) * modelScale);
       if (normalsData) {
         // inverse-transpose the blended transform so nonuniform scales keep the lighting right.
         const nx = normalsData[index * 3];
@@ -483,9 +484,9 @@ class TripoRiggedModel {
       } else {
         normals[index].set(0, 0, 0);
       }
-    }
+    });
     // only rebuild triangle normals when the file didn't provide authored normals.
-    if (!normalsData) for (const face of faces) {
+    if (!normalsData) faces.forEach((face) => {
       const a = vertices[face[0]];
       const b = vertices[face[1]];
       const c = vertices[face[2]];
@@ -494,14 +495,14 @@ class TripoRiggedModel {
       const nx = aby * acz - abz * acy;
       const ny = abz * acx - abx * acz;
       const nz = abx * acy - aby * acx;
-      for (const vertexIndex of face) {
+      face.forEach((vertexIndex) => {
         const normal = normals[vertexIndex];
         normal.x += nx;
         normal.y += ny;
         normal.z += nz;
-      }
-    }
-    for (const normal of normals) {
+      });
+    });
+    normals.forEach((normal) => {
       const magnitude = Math.sqrt(normal.x * normal.x + normal.y * normal.y + normal.z * normal.z);
       if (magnitude > 1e-12) {
         normal.x /= magnitude;
@@ -510,20 +511,20 @@ class TripoRiggedModel {
       } else {
         normal.set(0, 0, 0);
       }
-    }
+    });
     part.modelScale = modelScale;
-    part.worldVersion = this.#geometryVersion(part);
+    part.worldVersion = this._geometryVersion(part);
     // tell p5 to upload the changed buffers without recreating the geometry.
     part.geometry.dirtyFlags.vertices = true;
     part.geometry.dirtyFlags.vertexNormals = true;
   }
 
-  #drawSkeleton() {
+  _drawSkeleton() {
     const p = this.p;
     const positions = new Map();
     for (const [name, point] of this.pose) {
-      const position = this.#landmark(name);
-      if (position) positions.set(point.index, this.#scale(position, this.options.poseScale));
+      const position = this._landmark(name);
+      if (position) positions.set(point.index, this._scale(position, this.options.poseScale));
     }
     p.fill(153, 0, 255);
     p.stroke(53, 255, 173);
@@ -543,14 +544,14 @@ class TripoRiggedModel {
     }
   }
 
-  #updateTrace(frameSteps) {
+  _updateTrace(frameSteps) {
     if (frameSteps === 0) return;
     if (!this.options.traceLandmark || this.options.traceLength === 0) {
       this.trace.length = 0;
       return;
     }
-    const point = this.#landmark(this.options.traceLandmark);
-    if (point) this.trace.push(this.#scale(point, this.options.poseScale));
+    const point = this._landmark(this.options.traceLandmark);
+    if (point) this.trace.push(this._scale(point, this.options.poseScale));
     const cosine = Math.cos(this.options.traceRotation * frameSteps);
     const sine = Math.sin(this.options.traceRotation * frameSteps);
     for (const item of this.trace) {
@@ -561,7 +562,7 @@ class TripoRiggedModel {
     while (this.trace.length > this.options.traceLength) this.trace.shift();
   }
 
-  #drawTrace() {
+  _drawTrace() {
     if (this.trace.length < 2) return;
     const p = this.p;
     p.fill(238, 255, 255);
@@ -574,7 +575,7 @@ class TripoRiggedModel {
   }
 
   // let's unpack the glb and build the scene.
-  #parseGLB(buffer) {
+  _parseGLB(buffer) {
     const view = new DataView(buffer);
     if (view.byteLength < 20 || view.getUint32(0, true) !== 0x46546c67) throw new Error("Invalid GLB header.");
     if (view.getUint32(4, true) !== 2) throw new Error("Only GLB version 2 is supported.");
@@ -619,15 +620,15 @@ class TripoRiggedModel {
     return { gltf, binary };
   }
 
-  #createScene(parsed, loadId) {
+  _createScene(parsed, loadId) {
     const { gltf, binary } = parsed;
-    const nodes = gltf.nodes.map((definition, index) => this.#makeNode(definition, index));
+    const nodes = gltf.nodes.map((definition, index) => this._makeNode(definition, index));
     for (const [index, definition] of gltf.nodes.entries()) {
       if (definition.children !== undefined && !Array.isArray(definition.children)) {
         throw new Error(`Invalid children list on GLB node ${index}.`);
       }
       for (const childIndex of definition.children ?? []) {
-        const child = this.#entry(nodes, childIndex, "node");
+        const child = this._entry(nodes, childIndex, "node");
         if (!child || child.parent) throw new Error("GLB contains an invalid node hierarchy.");
         child.parent = nodes[index];
         child.parent.children.push(child);
@@ -642,61 +643,61 @@ class TripoRiggedModel {
       for (let i = node.children.length - 1; i >= 0; i--) pending.push(node.children[i]);
     }
     if (order.length !== nodes.length) throw new Error("GLB node hierarchy contains a cycle.");
-    const scene = this.#entry(gltf.scenes, gltf.scene ?? 0, "scene");
+    const scene = this._entry(gltf.scenes, gltf.scene ?? 0, "scene");
     if (!scene || !Array.isArray(scene.nodes)) throw new Error("GLB has no active scene.");
     const active = new Set();
     for (const root of scene.nodes) {
-      const node = this.#entry(nodes, root, "scene root");
+      const node = this._entry(nodes, root, "scene root");
       if (node.parent || active.has(node)) throw new Error("GLB scene roots must be unique parentless nodes.");
       active.add(node);
     }
     for (const node of order) {
       if (active.has(node.parent)) active.add(node);
-      this.#updateWorldNode(node);
+      this._updateWorldNode(node);
     }
     const byName = new Map();
     for (const node of active) {
       if (node.name && !byName.has(node.name)) byName.set(node.name, node);
     }
     const hips = byName.get("mixamorigHips");
-    const offset = hips ? this.#scale(this.#transformPoint(hips.worldMatrix, [0, 0, 0]), -1) : [0, 0, 0];
+    const offset = hips ? this._scale(this._transformPoint(hips.worldMatrix, [0, 0, 0]), -1) : [0, 0, 0];
     const rig = [];
-    for (const [name, endName, ...landmarks] of TripoRiggedModel.#boneMappings) {
+    TripoRiggedModel._boneMappings.forEach(([name, endName, ...landmarks]) => {
       const bone = byName.get(name);
       const end = byName.get(endName);
-      if (!bone || !end) continue;
-      const direction = this.#normalize(this.#subtract(
-        this.#transformPoint(end.worldMatrix, [0, 0, 0]),
-        this.#transformPoint(bone.worldMatrix, [0, 0, 0])
+      if (!bone || !end) return;
+      const direction = this._normalize(this._subtract(
+        this._transformPoint(end.worldMatrix, [0, 0, 0]),
+        this._transformPoint(bone.worldMatrix, [0, 0, 0])
       ));
-      if (this.#length(direction) < 1e-8) continue;
+      if (this._length(direction) < 1e-8) return;
       rig.push({
         bone, landmarks, bindDirection: direction,
         bindWorldQuaternion: bone.worldRotation.slice(),
         bindLocalQuaternion: bone.rotation.slice(),
         currentQuaternion: bone.rotation.slice(),
       });
-    }
+    });
     const parts = [];
-    for (const node of active) {
-      if (node.mesh === undefined) continue;
-      const mesh = this.#entry(gltf.meshes, node.mesh, "mesh");
+    active.forEach((node) => {
+      if (node.mesh === undefined) return;
+      const mesh = this._entry(gltf.meshes, node.mesh, "mesh");
       if (!Array.isArray(mesh.primitives) || !mesh.primitives.length) throw new Error("GLB mesh has no primitives.");
       if (mesh.weights?.length || mesh.primitives.some((primitive) => primitive.targets?.length)) {
         throw new Error("Morph targets are not supported by TripoRiggedModel.");
       }
-      const skin = node.skin === undefined ? null : this.#entry(gltf.skins, node.skin, "skin");
+      const skin = node.skin === undefined ? null : this._entry(gltf.skins, node.skin, "skin");
       if (skin && (!Array.isArray(skin.joints) || !skin.joints.length)) throw new Error("GLB skin has no joints.");
-      const joints = skin ? skin.joints.map((index) => this.#entry(nodes, index, "joint")) : [];
+      const joints = skin ? skin.joints.map((index) => this._entry(nodes, index, "joint")) : [];
       if (new Set(joints).size !== joints.length) throw new Error("GLB skin has duplicate joints.");
-      if (skin?.skeleton !== undefined) this.#entry(nodes, skin.skeleton, "skeleton");
+      if (skin?.skeleton !== undefined) this._entry(nodes, skin.skeleton, "skeleton");
       const inverseBindData = skin?.inverseBindMatrices === undefined
-        ? null : this.#readAccessor(gltf, binary, skin.inverseBindMatrices, "MAT4", [5126], joints.length);
+        ? null : this._readAccessor(gltf, binary, skin.inverseBindMatrices, "MAT4", [5126], joints.length);
       const inverseBinds = joints.map((_, index) => (
-        inverseBindData ? inverseBindData.slice(index * 16, index * 16 + 16) : this.#identityMatrix()
+        inverseBindData ? inverseBindData.slice(index * 16, index * 16 + 16) : this._identityMatrix()
       ));
-      for (const matrix of inverseBinds) this.#validateAffine(matrix, "inverse bind matrix");
-      for (const primitive of mesh.primitives) {
+      for (const matrix of inverseBinds) this._validateAffine(matrix, "inverse bind matrix");
+      mesh.primitives.forEach((primitive) => {
         if (primitive.mode !== undefined && primitive.mode !== 4) {
           throw new Error("Only triangle-list GLB primitives are supported.");
         }
@@ -705,40 +706,40 @@ class TripoRiggedModel {
           throw new Error("More than four skin influences per vertex are not supported.");
         }
         if (attributes.POSITION === undefined) throw new Error(`Mesh ${node.name} has no position attribute.`);
-        const positions = this.#readAccessor(gltf, binary, attributes.POSITION, "VEC3", [5126]);
+        const positions = this._readAccessor(gltf, binary, attributes.POSITION, "VEC3", [5126]);
         const vertexCount = positions.length / 3;
         const indices = primitive.indices === undefined
           ? Array.from({ length: vertexCount }, (_, index) => index)
-          : this.#readAccessor(gltf, binary, primitive.indices, "SCALAR", [5121, 5123, 5125]);
+          : this._readAccessor(gltf, binary, primitive.indices, "SCALAR", [5121, 5123, 5125]);
         if (indices.length % 3) throw new Error(`Mesh ${node.name} has an incomplete triangle.`);
         if (indices.some((index) => !Number.isInteger(index) || index < 0 || index >= vertexCount)) {
           throw new Error(`Mesh ${node.name} has an out-of-range triangle index.`);
         }
         const jointsData = attributes.JOINTS_0 === undefined
-          ? null : this.#readAccessor(gltf, binary, attributes.JOINTS_0, "VEC4", [5121, 5123], vertexCount);
+          ? null : this._readAccessor(gltf, binary, attributes.JOINTS_0, "VEC4", [5121, 5123], vertexCount);
         const weightsData = attributes.WEIGHTS_0 === undefined
-          ? null : this.#readAccessor(gltf, binary, attributes.WEIGHTS_0, "VEC4", [5126, 5121, 5123], vertexCount, true);
+          ? null : this._readAccessor(gltf, binary, attributes.WEIGHTS_0, "VEC4", [5126, 5121, 5123], vertexCount, true);
         if (!!jointsData !== !!weightsData) throw new Error(`Mesh ${node.name} has incomplete skin attributes.`);
         if (skin && !jointsData) throw new Error(`Skinned mesh ${node.name} requires joint and weight attributes.`);
         if (jointsData && (!skin || jointsData.some((joint) => !Number.isInteger(joint) || joint >= joints.length))) {
           throw new Error(`Mesh ${node.name} has an invalid skin joint index.`);
         }
         if (weightsData) {
-          for (let i = 0; i < vertexCount; i++) {
+          Array.from({ length: vertexCount }, (_, i) => {
             const weights = weightsData.slice(i * 4, i * 4 + 4);
             if (weights.some((weight) => weight < 0) || weights.reduce((sum, w) => sum + w, 0) <= 0) {
               throw new Error(`Mesh ${node.name} has invalid skin weights.`);
             }
-          }
+          });
         }
         const normalsData = attributes.NORMAL === undefined
-          ? null : this.#readAccessor(gltf, binary, attributes.NORMAL, "VEC3", [5126], vertexCount);
+          ? null : this._readAccessor(gltf, binary, attributes.NORMAL, "VEC3", [5126], vertexCount);
         const uvs = attributes.TEXCOORD_0 === undefined
-          ? null : this.#readAccessor(gltf, binary, attributes.TEXCOORD_0, "VEC2", [5126, 5121, 5123], vertexCount, true);
-        const material = primitive.material === undefined ? {} : this.#entry(gltf.materials, primitive.material, "material");
+          ? null : this._readAccessor(gltf, binary, attributes.TEXCOORD_0, "VEC2", [5126, 5121, 5123], vertexCount, true);
+        const material = primitive.material === undefined ? {} : this._entry(gltf.materials, primitive.material, "material");
         const pbr = material.pbrMetallicRoughness ?? {};
         const baseColor = pbr.baseColorFactor ?? [1, 1, 1, 1];
-        this.#finiteVector(baseColor, 4, "base color");
+        this._finiteVector(baseColor, 4, "base color");
         if (baseColor.some((v) => v < 0 || v > 1)) throw new Error("Base color values must be between 0 and 1.");
         if (pbr.baseColorTexture && (!uvs || (pbr.baseColorTexture.texCoord ?? 0) !== 0 ||
             pbr.baseColorTexture.extensions?.KHR_texture_transform)) {
@@ -746,37 +747,34 @@ class TripoRiggedModel {
         }
         const geometry = new globalThis.p5.Geometry();
         geometry.gid = `tripo-${this.id}-${parts.length}-${loadId}`;
-        geometry.vertexNormals = [];
         // glb and p5 image textures use the same v direction; don't flip it here.
-        for (let index = 0; index < vertexCount; index++) {
-          geometry.vertices.push(this.p.createVector(0, 0, 0));
-          geometry.vertexNormals.push(this.p.createVector(0, 0, 0));
-          geometry.uvs.push(uvs ? uvs[index * 2] : 0, uvs ? uvs[index * 2 + 1] : 0);
-        }
-        geometry.faces = [];
+        geometry.vertices = Array.from({ length: vertexCount }, () => this.p.createVector(0, 0, 0));
+        geometry.vertexNormals = Array.from({ length: vertexCount }, () => this.p.createVector(0, 0, 0));
+        geometry.uvs = uvs ? uvs.slice() : new Array(vertexCount * 2).fill(0);
         // the p5 y flip reverses winding; a reflected rigid node reverses it again.
-        const reflected = !skin && this.#determinant3(node.worldMatrix) < 0;
-        for (let i = 0; i < indices.length; i += 3) {
-          geometry.faces.push(reflected
+        const reflected = !skin && this._determinant3(node.worldMatrix) < 0;
+        geometry.faces = Array.from({ length: indices.length / 3 }, (_, face) => {
+          const i = face * 3;
+          return reflected
             ? [indices[i], indices[i + 1], indices[i + 2]]
-            : [indices[i], indices[i + 2], indices[i + 1]]);
-        }
+            : [indices[i], indices[i + 2], indices[i + 1]];
+        });
         parts.push({
           node, geometry, positions, normalsData, jointsData, weightsData, joints, inverseBinds,
           baseColor, alpha: material.alphaMode === "BLEND" ? baseColor[3] : 1,
           textureIndex: pbr.baseColorTexture?.index, texture: null, vertexCount,
         });
-      }
-    }
+      });
+    });
     if (!parts.length) throw new Error("The model contains no drawable meshes.");
     return { nodes, order, offset, rig, rigByNode: new Map(rig.map((item) => [item.bone, item])), parts };
   }
 
-  #makeNode(definition, index) {
+  _makeNode(definition, index) {
     if (!definition || typeof definition !== "object") throw new Error(`Invalid GLB node ${index}.`);
     const matrix = definition.matrix;
     if (matrix !== undefined) {
-      this.#validateAffine(matrix, `node ${index} matrix`);
+      this._validateAffine(matrix, `node ${index} matrix`);
       if (["translation", "rotation", "scale"].some((key) => definition[key] !== undefined)) {
         throw new Error(`GLB node ${index} cannot combine a matrix with translation, rotation or scale.`);
       }
@@ -788,21 +786,21 @@ class TripoRiggedModel {
     ];
     if (matrixScale) {
       // put the reflection into scale instead of losing it during quaternion extraction.
-      if (this.#determinant3(matrix) < 0) matrixScale[0] *= -1;
+      if (this._determinant3(matrix) < 0) matrixScale[0] *= -1;
       if (matrixScale.some((value) => value === 0)) throw new Error("Zero-scale node matrices are not supported.");
     }
     const translation = definition.translation ?? (matrix ? matrix.slice(12, 15) : [0, 0, 0]);
-    const rotation = definition.rotation ?? (matrix ? this.#matrixQuaternion(matrix, matrixScale) : [0, 0, 0, 1]);
+    const rotation = definition.rotation ?? (matrix ? this._matrixQuaternion(matrix, matrixScale) : [0, 0, 0, 1]);
     const scale = definition.scale ?? matrixScale ?? [1, 1, 1];
-    this.#finiteVector(translation, 3, `node ${index} translation`);
-    this.#finiteVector(rotation, 4, `node ${index} rotation`);
-    this.#finiteVector(scale, 3, `node ${index} scale`);
-    if (scale.some((value) => value === 0) || this.#dot(rotation, rotation) < 1e-12) {
+    this._finiteVector(translation, 3, `node ${index} translation`);
+    this._finiteVector(rotation, 4, `node ${index} rotation`);
+    this._finiteVector(scale, 3, `node ${index} scale`);
+    if (scale.some((value) => value === 0) || this._dot(rotation, rotation) < 1e-12) {
       throw new Error(`GLB node ${index} has a zero scale or invalid quaternion.`);
     }
-    const normalizedRotation = this.#normalizeQuaternion(rotation);
+    const normalizedRotation = this._normalizeQuaternion(rotation);
     if (matrix) {
-      const composed = this.#composeMatrix(translation, normalizedRotation, scale);
+      const composed = this._composeMatrix(translation, normalizedRotation, scale);
       if (matrix.some((value, i) => Math.abs(value - composed[i]) > 1e-5 * Math.max(1, Math.abs(value)))) {
         throw new Error(`GLB node ${index} contains unsupported shear.`);
       }
@@ -812,46 +810,46 @@ class TripoRiggedModel {
       mesh: definition.mesh, skin: definition.skin,
       translation: [...translation], rotation: normalizedRotation, scale: [...scale], matrix: matrix ? [...matrix] : null,
       parent: null, children: [],
-      worldMatrix: this.#identityMatrix(), worldRotation: [0, 0, 0, 1], worldVersion: 0,
+      worldMatrix: this._identityMatrix(), worldRotation: [0, 0, 0, 1], worldVersion: 0,
     };
   }
 
-  #updateWorldNode(node) {
-    const local = node.matrix ?? this.#composeMatrix(node.translation, node.rotation, node.scale);
-    node.worldMatrix = node.parent ? this.#multiplyMatrix(node.parent.worldMatrix, local) : local;
-    node.worldRotation = this.#normalizeQuaternion(
-      this.#multiplyQuaternion(node.parent?.worldRotation ?? [0, 0, 0, 1], node.rotation)
+  _updateWorldNode(node) {
+    const local = node.matrix ?? this._composeMatrix(node.translation, node.rotation, node.scale);
+    node.worldMatrix = node.parent ? this._multiplyMatrix(node.parent.worldMatrix, local) : local;
+    node.worldRotation = this._normalizeQuaternion(
+      this._multiplyQuaternion(node.parent?.worldRotation ?? [0, 0, 0, 1], node.rotation)
     );
     node.worldVersion++;
   }
 
-  #entry(array, index, label) {
+  _entry(array, index, label) {
     if (!Array.isArray(array) || !Number.isInteger(index) || index < 0 || index >= array.length || !array[index]) {
       throw new Error(`Invalid GLB ${label} index: ${index}.`);
     }
     return array[index];
   }
 
-  #finiteVector(value, size, label) {
+  _finiteVector(value, size, label) {
     if (!Array.isArray(value) || value.length !== size || !value.every(Number.isFinite)) {
       throw new Error(`GLB ${label} requires ${size} finite values.`);
     }
   }
 
-  #determinant3(m) {
+  _determinant3(m) {
     return m[0] * (m[5] * m[10] - m[9] * m[6])
       - m[4] * (m[1] * m[10] - m[9] * m[2]) + m[8] * (m[1] * m[6] - m[5] * m[2]);
   }
 
-  #validateAffine(matrix, label) {
-    this.#finiteVector(matrix, 16, label);
+  _validateAffine(matrix, label) {
+    this._finiteVector(matrix, 16, label);
     if (matrix[3] !== 0 || matrix[7] !== 0 || matrix[11] !== 0 || matrix[15] !== 1) {
       throw new Error(`GLB ${label} must be affine.`);
     }
   }
 
-  #bufferView(gltf, binary, index) {
-    const view = this.#entry(gltf.bufferViews, index, "buffer view");
+  _bufferView(gltf, binary, index) {
+    const view = this._entry(gltf.bufferViews, index, "buffer view");
     const start = view.byteOffset ?? 0;
     if (view.buffer !== 0 || !Number.isSafeInteger(start) || start < 0 ||
         !Number.isSafeInteger(view.byteLength) || view.byteLength < 1 || start + view.byteLength > binary.byteLength) {
@@ -860,8 +858,8 @@ class TripoRiggedModel {
     return view;
   }
 
-  #readAccessor(gltf, binary, accessorIndex, type, componentTypes, count, allowNormalized = false) {
-    const accessor = this.#entry(gltf.accessors, accessorIndex, "accessor");
+  _readAccessor(gltf, binary, accessorIndex, type, componentTypes, count, allowNormalized = false) {
+    const accessor = this._entry(gltf.accessors, accessorIndex, "accessor");
     if (accessor.sparse) throw new Error("Sparse GLB accessors are not supported.");
     if (accessor.type !== type || !componentTypes.includes(accessor.componentType)) {
       throw new Error(`GLB accessor ${accessorIndex} requires ${type} with component type ${componentTypes.join("/")}.`);
@@ -878,11 +876,11 @@ class TripoRiggedModel {
     if (allowNormalized && accessor.componentType !== 5126 && !accessor.normalized) {
       throw new Error("Integer GLB weights and texture coordinates must be normalized.");
     }
-    const components = TripoRiggedModel.#components[accessor.type];
-    const componentBytes = TripoRiggedModel.#componentBytes[accessor.componentType];
+    const components = TripoRiggedModel._components[accessor.type];
+    const componentBytes = TripoRiggedModel._componentBytes[accessor.componentType];
     if (!components || !componentBytes) throw new Error(`Unsupported GLB accessor type: ${accessor.type}.`);
     if (accessor.bufferView === undefined) throw new Error("GLB accessors without buffer views are not supported.");
-    const bufferView = this.#bufferView(gltf, binary, accessor.bufferView);
+    const bufferView = this._bufferView(gltf, binary, accessor.bufferView);
     const stride = bufferView.byteStride ?? components * componentBytes;
     const offset = accessor.byteOffset ?? 0;
     const start = (bufferView.byteOffset ?? 0) + offset;
@@ -895,20 +893,18 @@ class TripoRiggedModel {
         offset + (accessor.count - 1) * stride + components * componentBytes > bufferView.byteLength) {
       throw new Error(`GLB accessor ${accessorIndex} exceeds its buffer view or is misaligned.`);
     }
-    const result = new Array(accessor.count * components);
     const view = new DataView(binary);
-    for (let row = 0; row < accessor.count; row++) {
-      for (let column = 0; column < components; column++) {
-        let value = this.#readComponent(view, start + row * stride + column * componentBytes, accessor.componentType);
-        if (!Number.isFinite(value)) throw new Error(`Non-finite value in GLB accessor ${accessorIndex}.`);
-        if (accessor.normalized) value = this.#normalizedValue(value, accessor.componentType);
-        result[row * components + column] = value;
-      }
-    }
-    return result;
+    return Array.from({ length: accessor.count * components }, (_, item) => {
+      const row = Math.floor(item / components);
+      const column = item % components;
+      let value = this._readComponent(view, start + row * stride + column * componentBytes, accessor.componentType);
+      if (!Number.isFinite(value)) throw new Error(`Non-finite value in GLB accessor ${accessorIndex}.`);
+      if (accessor.normalized) value = this._normalizedValue(value, accessor.componentType);
+      return value;
+    });
   }
 
-  #readComponent(view, offset, type) {
+  _readComponent(view, offset, type) {
     switch (type) {
       case 5120: return view.getInt8(offset);
       case 5121: return view.getUint8(offset);
@@ -920,7 +916,7 @@ class TripoRiggedModel {
     }
   }
 
-  #normalizedValue(value, type) {
+  _normalizedValue(value, type) {
     if (type === 5120) return Math.max(value / 127, -1);
     if (type === 5121) return value / 255;
     if (type === 5122) return Math.max(value / 32767, -1);
@@ -928,34 +924,34 @@ class TripoRiggedModel {
     return value;
   }
 
-  #imageSource(parsed, textureIndex, url) {
+  _imageSource(parsed, textureIndex, url) {
     const { gltf, binary } = parsed;
-    const texture = this.#entry(gltf.textures, textureIndex, "texture");
-    const image = this.#entry(gltf.images, texture.source, "image");
+    const texture = this._entry(gltf.textures, textureIndex, "texture");
+    const image = this._entry(gltf.images, texture.source, "image");
     if (image.uri) {
       if (image.uri.startsWith("data:")) return image.uri;
       if (url === null) throw new Error("Local GLB files must embed their textures; external images are not supported.");
       return new URL(image.uri, new URL(url, this.p.canvas.ownerDocument.baseURI)).href;
     }
-    const view = this.#bufferView(gltf, binary, image.bufferView);
+    const view = this._bufferView(gltf, binary, image.bufferView);
     if (!view || !image.mimeType) throw new Error("GLB texture image must have a buffer view and MIME type.");
     const bytes = binary.slice(view.byteOffset ?? 0, (view.byteOffset ?? 0) + view.byteLength);
     return URL.createObjectURL(new Blob([bytes], { type: image.mimeType }));
   }
 
   // the small math helpers live down here to keep the public api easy to scan.
-  #add(a, b) { return a.map((value, i) => value + b[i]); }
-  #subtract(a, b) { return a.map((value, i) => value - b[i]); }
-  #scale(a, scalar) { return a.map((value) => value * scalar); }
-  #dot(a, b) { return a.reduce((sum, value, i) => sum + value * b[i], 0); }
-  #length(a) { return Math.sqrt(this.#dot(a, a)); }
+  _add(a, b) { return a.map((value, i) => value + b[i]); }
+  _subtract(a, b) { return a.map((value, i) => value - b[i]); }
+  _scale(a, scalar) { return a.map((value) => value * scalar); }
+  _dot(a, b) { return a.reduce((sum, value, i) => sum + value * b[i], 0); }
+  _length(a) { return Math.sqrt(this._dot(a, a)); }
 
-  #normalize(a) {
-    const magnitude = this.#length(a);
-    return magnitude > 1e-12 ? this.#scale(a, 1 / magnitude) : [0, 0, 0];
+  _normalize(a) {
+    const magnitude = this._length(a);
+    return magnitude > 1e-12 ? this._scale(a, 1 / magnitude) : [0, 0, 0];
   }
 
-  #multiplyQuaternion(a, b) {
+  _multiplyQuaternion(a, b) {
     const [ax, ay, az, aw] = a;
     const [bx, by, bz, bw] = b;
     return [
@@ -966,51 +962,51 @@ class TripoRiggedModel {
     ];
   }
 
-  #normalizeQuaternion(q) {
+  _normalizeQuaternion(q) {
     const magnitude = Math.hypot(...q);
     return magnitude > 1e-12 ? q.map((value) => value / magnitude) : [0, 0, 0, 1];
   }
 
-  #inverseQuaternion(q) {
-    const n = this.#dot(q, q);
+  _inverseQuaternion(q) {
+    const n = this._dot(q, q);
     return n > 1e-12 ? [-q[0] / n, -q[1] / n, -q[2] / n, q[3] / n] : [0, 0, 0, 1];
   }
 
-  #quaternionBetween(from, to) {
-    const a = this.#normalize(from);
-    const b = this.#normalize(to);
-    const cosine = this.#dot(a, b);
+  _quaternionBetween(from, to) {
+    const a = this._normalize(from);
+    const b = this._normalize(to);
+    const cosine = this._dot(a, b);
     if (cosine < -0.999999) {
       const axis = Math.abs(a[0]) < 0.9
-        ? this.#normalize([0, -a[2], a[1]]) : this.#normalize([-a[1], a[0], 0]);
+        ? this._normalize([0, -a[2], a[1]]) : this._normalize([-a[1], a[0], 0]);
       return [...axis, 0];
     }
     const cross = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
-    return this.#normalizeQuaternion([...cross, 1 + cosine]);
+    return this._normalizeQuaternion([...cross, 1 + cosine]);
   }
 
-  #slerp(a, b, amount) {
+  _slerp(a, b, amount) {
     let target = b;
-    let cosine = this.#dot(a, target);
+    let cosine = this._dot(a, target);
     if (cosine < 0) {
       target = target.map((value) => -value);
       cosine = -cosine;
     }
     if (cosine > 1 - 1e-12) {
-      return this.#normalizeQuaternion(a.map((value, i) => value + amount * (target[i] - value)));
+      return this._normalizeQuaternion(a.map((value, i) => value + amount * (target[i] - value)));
     }
     const angle = Math.acos(Math.max(-1, Math.min(1, cosine)));
     const denominator = Math.sin(angle);
     const left = Math.sin((1 - amount) * angle) / denominator;
     const right = Math.sin(amount * angle) / denominator;
-    return this.#normalizeQuaternion(a.map((value, i) => left * value + right * target[i]));
+    return this._normalizeQuaternion(a.map((value, i) => left * value + right * target[i]));
   }
 
-  #identityMatrix() {
+  _identityMatrix() {
     return [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1];
   }
 
-  #multiplyMatrix(a, b) {
+  _multiplyMatrix(a, b) {
     const out = new Array(16);
     for (let column = 0; column < 4; column++) {
       for (let row = 0; row < 4; row++) {
@@ -1021,8 +1017,8 @@ class TripoRiggedModel {
     return out;
   }
 
-  #composeMatrix(translation, rotation, size) {
-    const [x, y, z, w] = this.#normalizeQuaternion(rotation);
+  _composeMatrix(translation, rotation, size) {
+    const [x, y, z, w] = this._normalizeQuaternion(rotation);
     const [sx, sy, sz] = size;
     const xx = x * x; const yy = y * y; const zz = z * z;
     const xy = x * y; const xz = x * z; const yz = y * z;
@@ -1035,7 +1031,7 @@ class TripoRiggedModel {
     ];
   }
 
-  #transformPoint(matrix, point) {
+  _transformPoint(matrix, point) {
     const [x, y, z] = point;
     const w = matrix[3] * x + matrix[7] * y + matrix[11] * z + matrix[15];
     const divisor = w && w !== 1 ? w : 1;
@@ -1046,7 +1042,7 @@ class TripoRiggedModel {
     ];
   }
 
-  #matrixQuaternion(matrix, [sx, sy, sz]) {
+  _matrixQuaternion(matrix, [sx, sy, sz]) {
     const m00 = matrix[0] / sx; const m11 = matrix[5] / sy; const m22 = matrix[10] / sz;
     const m01 = matrix[4] / sy; const m02 = matrix[8] / sz;
     const m10 = matrix[1] / sx; const m12 = matrix[9] / sz;
@@ -1066,27 +1062,29 @@ class TripoRiggedModel {
       const s = 2 * Math.sqrt(1 + m22 - m00 - m11);
       q = [(m02 + m20) / s, (m12 + m21) / s, s / 4, (m10 - m01) / s];
     }
-    return this.#normalizeQuaternion(q);
+    return this._normalizeQuaternion(q);
   }
-
-  static #nextId = 0;
-  static #dropModels = [];
-  static #components = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
-  static #componentBytes = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
-  static #defaults = {
-    modelScale: 250, poseScale: 250, smoothing: 0.25, minConfidence: 0.3,
-    mirror: false, modelMirror: false, visible: true, showSkeleton: false,
-    jointSize: 6, traceLandmark: null, traceLength: 80, traceRotation: 0.01,
-  };
-  static #boneMappings = [
-    ["mixamorigSpine", "mixamorigSpine1", "left_hip", "left_shoulder", "right_hip", "right_shoulder"],
-    ["mixamorigLeftArm", "mixamorigLeftForeArm", "left_shoulder", "left_elbow"],
-    ["mixamorigLeftForeArm", "mixamorigLeftHand", "left_elbow", "left_wrist"],
-    ["mixamorigRightArm", "mixamorigRightForeArm", "right_shoulder", "right_elbow"],
-    ["mixamorigRightForeArm", "mixamorigRightHand", "right_elbow", "right_wrist"],
-    ["mixamorigLeftUpLeg", "mixamorigLeftLeg", "left_hip", "left_knee"],
-    ["mixamorigLeftLeg", "mixamorigLeftFoot", "left_knee", "left_ankle"],
-    ["mixamorigRightUpLeg", "mixamorigRightLeg", "right_hip", "right_knee"],
-    ["mixamorigRightLeg", "mixamorigRightFoot", "right_knee", "right_ankle"],
-  ];
 }
+
+// shared settings live down here on purpose: the p5 web editor can't rebuild static fields (or #private names).
+// so "_" just means "internal, please don't touch".
+TripoRiggedModel._nextId = 0;
+TripoRiggedModel._dropModels = [];
+TripoRiggedModel._components = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4, MAT4: 16 };
+TripoRiggedModel._componentBytes = { 5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4 };
+TripoRiggedModel._defaults = {
+  modelScale: 250, poseScale: 250, smoothing: 0.25, minConfidence: 0.3,
+  mirror: false, modelMirror: false, visible: true, showSkeleton: false,
+  jointSize: 6, traceLandmark: null, traceLength: 80, traceRotation: 0.01,
+};
+TripoRiggedModel._boneMappings = [
+  ["mixamorigSpine", "mixamorigSpine1", "left_hip", "left_shoulder", "right_hip", "right_shoulder"],
+  ["mixamorigLeftArm", "mixamorigLeftForeArm", "left_shoulder", "left_elbow"],
+  ["mixamorigLeftForeArm", "mixamorigLeftHand", "left_elbow", "left_wrist"],
+  ["mixamorigRightArm", "mixamorigRightForeArm", "right_shoulder", "right_elbow"],
+  ["mixamorigRightForeArm", "mixamorigRightHand", "right_elbow", "right_wrist"],
+  ["mixamorigLeftUpLeg", "mixamorigLeftLeg", "left_hip", "left_knee"],
+  ["mixamorigLeftLeg", "mixamorigLeftFoot", "left_knee", "left_ankle"],
+  ["mixamorigRightUpLeg", "mixamorigRightLeg", "right_hip", "right_knee"],
+  ["mixamorigRightLeg", "mixamorigRightFoot", "right_knee", "right_ankle"],
+];

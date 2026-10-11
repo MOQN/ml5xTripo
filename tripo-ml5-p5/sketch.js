@@ -1,7 +1,7 @@
 let bodyPose;
 let poses = [];
 
-let model;
+let tripoModel;
 
 async function setup() {
   createCanvas(800, 500, WEBGL);
@@ -13,7 +13,7 @@ async function setup() {
   bodyPose = await ml5.bodyPose("BlazePose");
   await bodyPose.ready;
 
-  model = await TripoRiggedModel.load("assets/moon.glb");
+  tripoModel = new TripoRiggedModel();
 
   bodyPose.detectStart(video, gotPoses);
 }
@@ -21,9 +21,9 @@ async function setup() {
 function draw() {
   background(0);
 
-  model.update(poses);
-  model.scale(0.5);
-  model.draw();
+  tripoModel.update(poses);
+  tripoModel.scale(0.5);
+  tripoModel.draw();
 }
 
 function gotPoses(results) {
