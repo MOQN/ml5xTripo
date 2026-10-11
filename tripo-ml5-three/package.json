@@ -1,0 +1,12 @@
+{
+  "name": "tripo-ml5-three",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone Three.js meshes driven by ml5 BlazePose",
+  "exports": "./TripoThree.js",
+  "scripts": {
+    "start": "npx --yes http-server@14.1.1 . -p 8082 -c-1",
+    "test": "node --loader ./tests/cdn-loader.js --test tests/*.test.js"
+  }
+}

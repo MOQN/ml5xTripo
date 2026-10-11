@@ -1,0 +1,44 @@
+body {
+  margin: 0;
+  background: #181818;
+  color: #eee;
+  font: 14px system-ui;
+}
+
+canvas {
+  display: block;
+}
+
+#controls {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  z-index: 1;
+  max-width: 300px;
+  padding: 16px;
+  background: #111e;
+  border-radius: 8px;
+}
+
+label {
+  display: block;
+  margin: 10px 0;
+}
+
+button,
+select {
+  font: inherit;
+}
+
+#status {
+  line-height: 1.5;
+}
+
+#preview {
+  position: fixed;
+  bottom: 16px;
+  left: 16px;
+  width: 240px;
+  transform: scaleX(-1);
+  border-radius: 8px;
+}
